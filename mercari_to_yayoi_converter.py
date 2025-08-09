@@ -75,53 +75,73 @@ class MercariToYayoiConverter:
         transactions = []
         filtered_count = 0
         
+        # Try different encodings for shop CSV files
+        encodings_to_try = ['shift-jis', 'cp932', 'utf-8-sig', 'utf-8']
+        file_content = None
+        used_encoding = None
+        
+        for encoding in encodings_to_try:
+            try:
+                with open(csv_file_path, 'r', encoding=encoding) as file:
+                    file_content = file.read()
+                    used_encoding = encoding
+                    print(f"Successfully read shop CSV with {encoding} encoding")
+                    break
+            except UnicodeDecodeError:
+                continue
+        
+        if file_content is None:
+            print(f"Error: Could not read CSV file with any supported encoding")
+            sys.exit(1)
+        
         try:
-            with open(csv_file_path, 'r', encoding='shift-jis') as file:
-                reader = csv.reader(file)
-                headers = next(reader)  # Skip header row
+            import io
+            file = io.StringIO(file_content)
+            reader = csv.reader(file)
+            headers = next(reader)  # Skip header row
+            
+            for row in reader:
+                if len(row) < 16:  # Need at least 16 columns
+                    continue
+                    
+                # Skip cancelled orders (negative sales amount)
+                try:
+                    sales_amount = int(row[11])
+                    if sales_amount < 0:
+                        print(f"Skipping cancelled order: {row[0]}")
+                        continue
+                except (ValueError, IndexError):
+                    continue
                 
-                for row in reader:
-                    if len(row) < 16:  # Need at least 16 columns
-                        continue
-                        
-                    # Skip cancelled orders (negative sales amount)
+                # Filter by date range if specified
+                if self.start_date or self.end_date:
+                    sales_transfer_date_str = row[6]  # Sales transfer date (売上移転日) column
                     try:
-                        sales_amount = int(row[11])
-                        if sales_amount < 0:
-                            print(f"Skipping cancelled order: {row[0]}")
+                        # Parse the shop date format (2025/7/1 12:53:41)
+                        transaction_date = datetime.strptime(sales_transfer_date_str.strip(), "%Y/%m/%d %H:%M:%S")
+                        
+                        # Check if within date range
+                        if self.start_date and transaction_date < self.start_date:
+                            filtered_count += 1
                             continue
-                    except (ValueError, IndexError):
-                        continue
-                    
-                    # Filter by date range if specified
-                    if self.start_date or self.end_date:
-                        sales_transfer_date_str = row[6]  # Sales transfer date (売上移転日) column
-                        try:
-                            # Parse the shop date format (2025/7/1 12:53:41)
-                            transaction_date = datetime.strptime(sales_transfer_date_str.strip(), "%Y/%m/%d %H:%M:%S")
-                            
-                            # Check if within date range
-                            if self.start_date and transaction_date < self.start_date:
-                                filtered_count += 1
-                                continue
-                            if self.end_date and transaction_date > self.end_date.replace(hour=23, minute=59, second=59):
-                                filtered_count += 1
-                                continue
-                        except ValueError:
-                            print(f"Warning: Could not parse date '{sales_transfer_date_str}'. Including transaction.")
-                    
-                    # Convert to standard format for processing
-                    transaction = {
-                        "購入完了日": row[6],  # Sales transfer date (売上移転日) - column 6
-                        "商品ID": row[0],     # Order ID
-                        "商品名": row[8],     # Product name
-                        "商品代金": row[12],  # Product price
-                        "販売手数料": row[15], # Sales fee
-                        "配送料": row[13],    # Shipping fee
-                        "販売利益": row[11],  # Sales profit (net amount)
-                        "購入者": row[19]     # Shop name (use as counterparty)
-                    }
-                    transactions.append(transaction)
+                        if self.end_date and transaction_date > self.end_date.replace(hour=23, minute=59, second=59):
+                            filtered_count += 1
+                            continue
+                    except ValueError:
+                        print(f"Warning: Could not parse date '{sales_transfer_date_str}'. Including transaction.")
+                
+                # Convert to standard format for processing
+                transaction = {
+                    "購入完了日": row[6],  # Sales transfer date (売上移転日) - column 6
+                    "商品ID": row[0],     # Order ID
+                    "商品名": row[8],     # Product name
+                    "商品代金": row[12],  # Product price
+                    "販売手数料": row[15], # Sales fee
+                    "配送料": row[13],    # Shipping fee
+                    "販売利益": row[11],  # Sales profit (net amount)
+                    "購入者": row[19]     # Shop name (use as counterparty)
+                }
+                transactions.append(transaction)
                     
             if filtered_count > 0:
                 print(f"Filtered out {filtered_count} transactions outside the date range.")
@@ -163,6 +183,13 @@ class MercariToYayoiConverter:
         date = self.format_date(mercari_transaction.get("購入完了日", ""))
         product_id = mercari_transaction.get("商品ID", "")
         product_name = mercari_transaction.get("商品名", "")
+        
+        # Clean up product name to remove problematic Unicode characters
+        # Replace narrow no-break space (U+202F) and other problematic characters
+        product_name = product_name.replace('\u202f', ' ')  # narrow no-break space
+        product_name = product_name.replace('\u00a0', ' ')  # non-breaking space
+        product_name = product_name.replace('\u2009', ' ')  # thin space
+        product_name = product_name.replace('\u200a', ' ')  # hair space
         
         # Convert price fields to integers, handling non-numeric values
         try:
@@ -277,10 +304,33 @@ class MercariToYayoiConverter:
                 method_filename = self._get_filename_for_method(method)
                 output_path = f"{base_output_path}_{method_filename}.csv"
                 
-                with open(output_path, 'w', newline='', encoding='shift_jis') as file:
+                with open(output_path, 'w', newline='', encoding='shift_jis', errors='replace') as file:
                     writer = csv.DictWriter(file, fieldnames=self.yayoi_headers, quoting=csv.QUOTE_ALL)
                     # Don't write header - Yayoi doesn't need it
-                    writer.writerows(transactions)
+                    
+                    # Write rows one by one to handle encoding issues
+                    for transaction in transactions:
+                        try:
+                            # Clean up all fields to ensure Shift-JIS compatibility
+                            cleaned_transaction = {}
+                            for key, value in transaction.items():
+                                if value and isinstance(value, str):
+                                    # Replace problematic Unicode characters
+                                    value = value.replace('\u202f', ' ')  # narrow no-break space
+                                    value = value.replace('\u00a0', ' ')  # non-breaking space
+                                    value = value.replace('\u2009', ' ')  # thin space
+                                    value = value.replace('\u200a', ' ')  # hair space
+                                    # Try to encode to shift_jis to check for other issues
+                                    try:
+                                        value.encode('shift_jis')
+                                    except UnicodeEncodeError:
+                                        # Replace any remaining problematic characters with spaces
+                                        value = ''.join(char if ord(char) < 0x10000 else ' ' for char in value)
+                                cleaned_transaction[key] = value
+                            writer.writerow(cleaned_transaction)
+                        except Exception as e:
+                            print(f"Warning: Could not write transaction: {e}")
+                            continue
                 
                 output_files.append(output_path)
                 print(f"Created: {output_path} ({len(transactions)} entries)")
