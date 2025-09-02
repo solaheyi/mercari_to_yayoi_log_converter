@@ -101,14 +101,19 @@ class MercariToYayoiConverter:
             headers = next(reader)  # Skip header row
             
             for row in reader:
-                if len(row) < 16:  # Need at least 16 columns
+                if len(row) < 20:  # Need at least 20 columns for shop CSV
                     continue
                     
-                # Skip cancelled orders (negative sales amount)
+                # Skip cancelled orders - check cancel date column (column 7)
+                if len(row) > 7 and row[7] and row[7] != '-':
+                    print(f"Skipping cancelled order: {row[0]} (cancelled on {row[7]})")
+                    continue
+                    
+                # Also skip orders with negative sales amount
                 try:
                     sales_amount = int(row[11])
                     if sales_amount < 0:
-                        print(f"Skipping cancelled order: {row[0]}")
+                        print(f"Skipping order with negative amount: {row[0]}")
                         continue
                 except (ValueError, IndexError):
                     continue
